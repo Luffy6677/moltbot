@@ -1,4 +1,4 @@
-export type TtsProvider = "elevenlabs" | "openai" | "edge";
+export type TtsProvider = "elevenlabs" | "openai" | "edge" | "doubao";
 
 export type TtsMode = "final" | "all";
 
@@ -72,6 +72,22 @@ export type TtsConfig = {
     saveSubtitles?: boolean;
     proxy?: string;
     timeoutMs?: number;
+  };
+  /** Doubao (Volcano Engine / 火山引擎) TTS configuration. */
+  doubao?: {
+    appId?: string;
+    /** Access Key from Volcano Engine console. */
+    accessKey?: string;
+    /** Voice ID / speaker name (e.g., BV001_streaming, BV002_streaming). */
+    speaker?: string;
+    /** Audio encoding: mp3, wav, ogg_opus, pcm. */
+    encoding?: string;
+    /** Speech speed ratio (0.5-2.0). */
+    speedRatio?: number;
+    /** Speech volume ratio (0.5-2.0). */
+    volumeRatio?: number;
+    /** Speech pitch ratio (0.5-2.0). */
+    pitchRatio?: number;
   };
   /** Optional path for local TTS user preferences JSON. */
   prefsPath?: string;

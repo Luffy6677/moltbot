@@ -52,6 +52,12 @@ const DEFAULT_EDGE_VOICE = "en-US-MichelleNeural";
 const DEFAULT_EDGE_LANG = "en-US";
 const DEFAULT_EDGE_OUTPUT_FORMAT = "audio-24khz-48kbitrate-mono-mp3";
 
+const DEFAULT_DOUBAO_SPEAKER = "BV001_streaming";
+const DEFAULT_DOUBAO_ENCODING = "mp3";
+const DEFAULT_DOUBAO_SPEED_RATIO = 1.0;
+const DEFAULT_DOUBAO_VOLUME_RATIO = 1.0;
+const DEFAULT_DOUBAO_PITCH_RATIO = 1.0;
+
 const DEFAULT_ELEVENLABS_VOICE_SETTINGS = {
   stability: 0.5,
   similarityBoost: 0.75,
@@ -123,6 +129,15 @@ export type ResolvedTtsConfig = {
     saveSubtitles: boolean;
     proxy?: string;
     timeoutMs?: number;
+  };
+  doubao: {
+    appId?: string;
+    accessKey?: string;
+    speaker: string;
+    encoding: string;
+    speedRatio: number;
+    volumeRatio: number;
+    pitchRatio: number;
   };
   prefsPath?: string;
   maxTextLength: number;
@@ -295,6 +310,15 @@ export function resolveTtsConfig(cfg: OpenClawConfig): ResolvedTtsConfig {
       saveSubtitles: raw.edge?.saveSubtitles ?? false,
       proxy: raw.edge?.proxy?.trim() || undefined,
       timeoutMs: raw.edge?.timeoutMs,
+    },
+    doubao: {
+      appId: raw.doubao?.appId?.trim() || undefined,
+      accessKey: raw.doubao?.accessKey?.trim() || undefined,
+      speaker: raw.doubao?.speaker?.trim() || DEFAULT_DOUBAO_SPEAKER,
+      encoding: raw.doubao?.encoding?.trim() || DEFAULT_DOUBAO_ENCODING,
+      speedRatio: raw.doubao?.speedRatio ?? DEFAULT_DOUBAO_SPEED_RATIO,
+      volumeRatio: raw.doubao?.volumeRatio ?? DEFAULT_DOUBAO_VOLUME_RATIO,
+      pitchRatio: raw.doubao?.pitchRatio ?? DEFAULT_DOUBAO_PITCH_RATIO,
     },
     prefsPath: raw.prefsPath,
     maxTextLength: raw.maxTextLength ?? DEFAULT_MAX_TEXT_LENGTH,
@@ -474,10 +498,13 @@ export function resolveTtsApiKey(
   if (provider === "openai") {
     return config.openai.apiKey || process.env.OPENAI_API_KEY;
   }
+  if (provider === "doubao") {
+    return config.doubao.accessKey || process.env.DOUBAO_ACCESS_KEY;
+  }
   return undefined;
 }
 
-export const TTS_PROVIDERS = ["openai", "elevenlabs", "edge"] as const;
+export const TTS_PROVIDERS = ["openai", "elevenlabs", "doubao", "edge"] as const;
 
 export function resolveTtsProviderOrder(primary: TtsProvider): TtsProvider[] {
   return [primary, ...TTS_PROVIDERS.filter((provider) => provider !== primary)];
@@ -1044,6 +1071,90 @@ async function openaiTTS(params: {
   }
 }
 
+async function doubaoTTS(params: {
+  text: string;
+  appId: string;
+  accessKey: string;
+  speaker: string;
+  encoding: string;
+  speedRatio: number;
+  volumeRatio: number;
+  pitchRatio: number;
+  timeoutMs: number;
+}): Promise<{ buffer: Buffer; encoding: string }> {
+  const {
+    text,
+    appId,
+    accessKey,
+    speaker,
+    encoding,
+    speedRatio,
+    volumeRatio,
+    pitchRatio,
+    timeoutMs,
+  } = params;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    // Volcano Engine TTS API
+    // https://www.volcengine.com/docs/6561/79823
+    const requestBody = JSON.stringify({
+      app: {
+        appid: appId,
+        token: "access_token",
+        cluster: "volcano_tts",
+      },
+      user: {
+        uid: "openclaw-user",
+      },
+      audio: {
+        voice_type: speaker,
+        encoding,
+        speed_ratio: speedRatio,
+        volume_ratio: volumeRatio,
+        pitch_ratio: pitchRatio,
+      },
+      request: {
+        reqid: `openclaw-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        text,
+        text_type: "plain",
+        operation: "query",
+      },
+    });
+
+    const response = await fetch("https://openspeech.bytedance.com/api/v1/tts", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer;${accessKey}`,
+      },
+      body: requestBody,
+      signal: controller.signal,
+    });
+
+    const result = (await response.json()) as {
+      code: number;
+      message: string;
+      data?: string;
+      addition?: { duration: string };
+    };
+
+    if (result.code !== 3000 || !result.data) {
+      throw new Error(
+        `Doubao TTS error: ${result.message || "unknown error"} (code: ${result.code})`,
+      );
+    }
+
+    // Response data is base64-encoded audio
+    const audioBuffer = Buffer.from(result.data, "base64");
+    return { buffer: audioBuffer, encoding };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function inferEdgeExtension(outputFormat: string): string {
   const normalized = outputFormat.toLowerCase();
   if (normalized.includes("webm")) return ".webm";
@@ -1180,6 +1291,9 @@ export async function textToSpeech(params: {
       }
 
       let audioBuffer: Buffer;
+      let outputEncoding: string;
+      let outputExtension: string;
+
       if (provider === "elevenlabs") {
         const voiceIdOverride = params.overrides?.elevenlabs?.voiceId;
         const modelIdOverride = params.overrides?.elevenlabs?.modelId;
@@ -1203,6 +1317,34 @@ export async function textToSpeech(params: {
           voiceSettings,
           timeoutMs: config.timeoutMs,
         });
+        outputEncoding = output.elevenlabs;
+        outputExtension = output.extension;
+      } else if (provider === "doubao") {
+        if (!config.doubao.appId) {
+          lastError = "doubao: missing appId";
+          continue;
+        }
+        const doubaoResult = await doubaoTTS({
+          text: params.text,
+          appId: config.doubao.appId,
+          accessKey: apiKey,
+          speaker: config.doubao.speaker,
+          encoding: config.doubao.encoding,
+          speedRatio: config.doubao.speedRatio,
+          volumeRatio: config.doubao.volumeRatio,
+          pitchRatio: config.doubao.pitchRatio,
+          timeoutMs: config.timeoutMs,
+        });
+        audioBuffer = doubaoResult.buffer;
+        outputEncoding = doubaoResult.encoding;
+        // Map encoding to extension
+        const encToExt: Record<string, string> = {
+          mp3: ".mp3",
+          wav: ".wav",
+          ogg_opus: ".opus",
+          pcm: ".pcm",
+        };
+        outputExtension = encToExt[doubaoResult.encoding] ?? ".mp3";
       } else {
         const openaiModelOverride = params.overrides?.openai?.model;
         const openaiVoiceOverride = params.overrides?.openai?.voice;
@@ -1214,22 +1356,27 @@ export async function textToSpeech(params: {
           responseFormat: output.openai,
           timeoutMs: config.timeoutMs,
         });
+        outputEncoding = output.openai;
+        outputExtension = output.extension;
       }
 
       const latencyMs = Date.now() - providerStart;
 
       const tempDir = mkdtempSync(path.join(tmpdir(), "tts-"));
-      const audioPath = path.join(tempDir, `voice-${Date.now()}${output.extension}`);
+      const audioPath = path.join(tempDir, `voice-${Date.now()}${outputExtension}`);
       writeFileSync(audioPath, audioBuffer);
       scheduleCleanup(tempDir);
+
+      const voiceCompatible =
+        provider === "doubao" ? config.doubao.encoding === "ogg_opus" : output.voiceCompatible;
 
       return {
         success: true,
         audioPath,
         latencyMs,
         provider,
-        outputFormat: provider === "openai" ? output.openai : output.elevenlabs,
-        voiceCompatible: output.voiceCompatible,
+        outputFormat: outputEncoding,
+        voiceCompatible,
       };
     } catch (err) {
       const error = err as Error;
